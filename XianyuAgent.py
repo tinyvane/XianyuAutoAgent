@@ -9,8 +9,8 @@ class XianyuReplyBot:
     def __init__(self):
         # 初始化OpenAI客户端
         self.client = OpenAI(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
+            api_key=os.getenv("API_KEY"),
+            base_url=os.getenv("MODEL_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
         )
         self._init_system_prompts()
         self._init_agents()
@@ -28,29 +28,33 @@ class XianyuReplyBot:
         }
 
     def _init_system_prompts(self):
-        """初始化各Agent专用提示词，直接从文件中加载"""
+        """初始化各Agent专用提示词，优先加载用户自定义文件，否则使用Example默认文件"""
         prompt_dir = "prompts"
         
+        def load_prompt_content(name: str) -> str:
+            """尝试加载提示词文件"""
+            # 优先尝试加载 target.txt
+            target_path = os.path.join(prompt_dir, f"{name}.txt")
+            if os.path.exists(target_path):
+                file_path = target_path
+            else:
+                # 尝试默认提示词 target_example.txt
+                file_path = os.path.join(prompt_dir, f"{name}_example.txt")
+
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+                logger.debug(f"已加载 {name} 提示词，路径: {file_path}, 长度: {len(content)} 字符")
+                return content
+
         try:
             # 加载分类提示词
-            with open(os.path.join(prompt_dir, "classify_prompt.txt"), "r", encoding="utf-8") as f:
-                self.classify_prompt = f.read()
-                logger.debug(f"已加载分类提示词，长度: {len(self.classify_prompt)} 字符")
-            
+            self.classify_prompt = load_prompt_content("classify_prompt")
             # 加载价格提示词
-            with open(os.path.join(prompt_dir, "price_prompt.txt"), "r", encoding="utf-8") as f:
-                self.price_prompt = f.read()
-                logger.debug(f"已加载价格提示词，长度: {len(self.price_prompt)} 字符")
-            
+            self.price_prompt = load_prompt_content("price_prompt")
             # 加载技术提示词
-            with open(os.path.join(prompt_dir, "tech_prompt.txt"), "r", encoding="utf-8") as f:
-                self.tech_prompt = f.read()
-                logger.debug(f"已加载技术提示词，长度: {len(self.tech_prompt)} 字符")
-            
+            self.tech_prompt = load_prompt_content("tech_prompt")
             # 加载默认提示词
-            with open(os.path.join(prompt_dir, "default_prompt.txt"), "r", encoding="utf-8") as f:
-                self.default_prompt = f.read()
-                logger.debug(f"已加载默认提示词，长度: {len(self.default_prompt)} 字符")
+            self.default_prompt = load_prompt_content("default_prompt")
                 
             logger.info("成功加载所有提示词")
         except Exception as e:
@@ -85,7 +89,12 @@ class XianyuReplyBot:
 
         internal_intents = {'classify'}  # 定义不对外开放的Agent
 
-        if detected_intent in self.agents and detected_intent not in internal_intents:
+        if detected_intent == 'no_reply':
+            # 无需回复的情况
+            logger.info(f'意图识别完成: no_reply - 无需回复')
+            self.last_intent = 'no_reply'
+            return "-"  # 返回特殊标记，表示无需回复
+        elif detected_intent in self.agents and detected_intent not in internal_intents:
             agent = self.agents[detected_intent]
             logger.info(f'意图识别完成: {detected_intent}')
             self.last_intent = detected_intent  # 保存当前意图
@@ -213,7 +222,7 @@ class BaseAgent:
     def _call_llm(self, messages: List[Dict], temperature: float = 0.4) -> str:
         """调用大模型"""
         response = self.client.chat.completions.create(
-            model="qwen-max",
+            model=os.getenv("MODEL_NAME", "qwen-max"),
             messages=messages,
             temperature=temperature,
             max_tokens=500,
@@ -232,7 +241,7 @@ class PriceAgent(BaseAgent):
         messages[0]['content'] += f"\n▲当前议价轮次：{bargain_count}"
 
         response = self.client.chat.completions.create(
-            model="qwen-max",
+            model=os.getenv("MODEL_NAME", "qwen-max"),
             messages=messages,
             temperature=dynamic_temp,
             max_tokens=500,
@@ -253,7 +262,7 @@ class TechAgent(BaseAgent):
         # messages[0]['content'] += "\n▲知识库：\n" + self._fetch_tech_specs()
 
         response = self.client.chat.completions.create(
-            model="qwen-max",
+            model=os.getenv("MODEL_NAME", "qwen-max"),
             messages=messages,
             temperature=0.4,
             max_tokens=500,

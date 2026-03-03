@@ -51,7 +51,8 @@ class XianyuApis:
         """更新.env文件中的COOKIES_STR"""
         try:
             # 获取当前cookies的字符串形式
-            cookie_str = '; '.join([f"{cookie.name}={cookie.value}" for cookie in self.session.cookies])
+            # curl_cffi 的 Cookies 迭代时 yield 的是 cookie name (str)
+            cookie_str = '; '.join([f"{name}={self.session.cookies.get(name)}" for name in self.session.cookies])
             
             # 读取.env文件
             env_path = os.path.join(os.getcwd(), '.env')
