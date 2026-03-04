@@ -628,16 +628,33 @@ class XianyuLive:
                         content_type = int(inner_ct)
                     if content_type == 2:  # photo
                         meta = json.loads(custom.get("5", "{}"))
-                        photo = meta.get("photo", {})
-                        media_id = photo.get("mediaId", "")
+                        # 优先从 image.pics[].url 提取阿里CDN图片URL
+                        image_url = ""
+                        pics = meta.get("image", {}).get("pics", [])
+                        if pics and isinstance(pics, list):
+                            image_url = pics[0].get("url", "")
+                            width = pics[0].get("width", "")
+                            height = pics[0].get("height", "")
+                        else:
+                            # 兜底：旧格式 photo.mediaId
+                            photo = meta.get("photo", {})
+                            media_id = photo.get("mediaId", "")
+                            image_url = mid2url(media_id) if media_id else ""
+                            width = photo.get("extension", {}).get("width", "")
+                            height = photo.get("extension", {}).get("height", "")
                         image_info = {
-                            "mediaId": media_id,
-                            "width": photo.get("extension", {}).get("width", ""),
-                            "height": photo.get("extension", {}).get("height", ""),
-                            "_url": mid2url(media_id) if media_id else "",
+                            "_url": image_url,
+                            "width": width,
+                            "height": height,
                         }
-            except Exception:
-                pass
+                        if image_url:
+                            logger.info(f"从消息中提取到图片URL: {image_url}")
+            except Exception as e:
+                logger.debug(f"解析图片元数据异常: {e}")
+            # 兜底：通过 reminderContent 检测图片消息
+            if content_type == 1 and send_message in ("[图片]", "[图片消息]"):
+                content_type = 2
+                logger.debug("通过 reminderContent 检测到图片消息")
 
             # 时效性验证（过滤5分钟前消息）
             if (time.time() * 1000 - create_time) > self.message_expire_time:
@@ -705,12 +722,13 @@ class XianyuLive:
             item_description=f"当前商品的信息如下：{self.build_item_description(item_info)}"
 
             # 将多媒体消息转换为 LLM 可理解的描述文本
-            if content_type == 2 and image_info:
-                send_message = "[用户发送了一张图片]"
-                logger.info(f"收到图片消息, mediaId: {image_info.get('mediaId', '')}")
-            elif content_type == 2:
-                send_message = "[用户发送了一张图片]"
-                logger.info("收到图片消息 (无元数据)")
+            if content_type == 2:
+                image_url_resolved = (image_info.get("_url", "") if image_info else "") or ""
+                if not image_info:
+                    image_info = {}
+                image_info["_url"] = image_url_resolved
+                send_message = "[用户发送了一张图片，请仔细查看图片内容并结合商品信息回复]"
+                logger.info(f"收到图片消息, URL: {image_url_resolved}")
             elif content_type == 3:
                 send_message = "[用户发送了一段语音]"
                 logger.info("收到语音消息")
