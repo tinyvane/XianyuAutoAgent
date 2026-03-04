@@ -15,6 +15,7 @@ from utils.xianyu_utils import generate_mid, generate_uuid, trans_cookies, gener
 from XianyuAgent import XianyuReplyBot
 from context_manager import ChatContextManager
 from utils.notifier import get_notifier
+from utils.media_downloader import MediaDownloader
 
 
 # Cookie 刷新配置
@@ -57,8 +58,12 @@ class XianyuLive:
         self.xianyu.session.cookies.update(self.cookies)  # 直接使用 session.cookies.update
         self.myid = self.cookies['unb']
         self.device_id = _get_or_create_device_id(self.myid)
-        self.context_manager = ChatContextManager()
+        self.context_manager = ChatContextManager(seller_id=self.myid)
         self.notifier = get_notifier()
+
+        # 媒体下载器
+        media_delay = float(os.getenv("MEDIA_DOWNLOAD_DELAY", "0.5"))
+        self.media_downloader = MediaDownloader(self.context_manager, download_delay=media_delay)
 
         # 心跳相关配置
         self.heartbeat_interval = int(os.getenv("HEARTBEAT_INTERVAL", "15"))  # 心跳间隔，默认15秒
@@ -476,6 +481,39 @@ class XianyuLive:
             self.enter_manual_mode(chat_id)
             return "manual"
     
+    def _extract_voice_url(self, message):
+        """从消息结构中提取语音URL"""
+        try:
+            content_layer = message.get("1", {}).get("6", {})
+            custom = content_layer.get("3") if isinstance(content_layer, dict) else None
+            if isinstance(custom, dict):
+                meta = json.loads(custom.get("5", "{}"))
+                # 尝试 audio.url
+                audio_url = meta.get("audio", {}).get("url", "")
+                if audio_url:
+                    return audio_url
+                # 尝试 voice.url
+                voice_url = meta.get("voice", {}).get("url", "")
+                if voice_url:
+                    return voice_url
+        except Exception as e:
+            logger.debug(f"提取语音URL异常: {e}")
+        return ""
+
+    def _extract_video_url(self, message):
+        """从消息结构中提取视频URL"""
+        try:
+            content_layer = message.get("1", {}).get("6", {})
+            custom = content_layer.get("3") if isinstance(content_layer, dict) else None
+            if isinstance(custom, dict):
+                meta = json.loads(custom.get("5", "{}"))
+                video_url = meta.get("video", {}).get("url", "")
+                if video_url:
+                    return video_url
+        except Exception as e:
+            logger.debug(f"提取视频URL异常: {e}")
+        return ""
+
     def format_price(self, price):
         """
         处理逻辑：标准化价格（分转元）
@@ -684,7 +722,8 @@ class XianyuLive:
                     return
                 
                 # 记录卖家人工回复
-                self.context_manager.add_message_by_chat(chat_id, self.myid, item_id, "assistant", send_message)
+                self.context_manager.add_message_by_chat(chat_id, self.myid, item_id, "assistant", send_message,
+                                                         content_type=content_type)
                 logger.info(f"卖家人工回复 (会话: {chat_id}, 商品: {item_id}): {send_message}")
                 return
             
@@ -695,7 +734,8 @@ class XianyuLive:
             if self.is_manual_mode(chat_id):
                 logger.info(f"🔴 会话 {chat_id} 处于人工接管模式，跳过自动回复")
                 # 添加用户消息到上下文
-                self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
+                self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message,
+                                                         content_type=content_type)
                 return
             # 检查是否为带中括号的系统消息
             if self.is_bracket_system_message(send_message):
@@ -721,7 +761,8 @@ class XianyuLive:
                 
             item_description=f"当前商品的信息如下：{self.build_item_description(item_info)}"
 
-            # 将多媒体消息转换为 LLM 可理解的描述文本
+            # 将多媒体消息转换为 LLM 可理解的描述文本 + 保存媒体记录
+            media_file_id = None
             if content_type == 2:
                 image_url_resolved = (image_info.get("_url", "") if image_info else "") or ""
                 if not image_info:
@@ -729,12 +770,33 @@ class XianyuLive:
                 image_info["_url"] = image_url_resolved
                 send_message = "[用户发送了一张图片，请仔细查看图片内容并结合商品信息回复]"
                 logger.info(f"收到图片消息, URL: {image_url_resolved}")
+                if image_url_resolved:
+                    media_file_id = self.context_manager.save_media_record(
+                        chat_id, 'image', image_url_resolved,
+                        buyer_id=send_user_id, item_id=item_id,
+                        metadata=image_info
+                    )
+                    await self.media_downloader.enqueue(media_file_id, chat_id, 'image', image_url_resolved)
             elif content_type == 3:
+                voice_url = self._extract_voice_url(message)
                 send_message = "[用户发送了一段语音]"
-                logger.info("收到语音消息")
+                logger.info(f"收到语音消息, URL: {voice_url}")
+                if voice_url:
+                    media_file_id = self.context_manager.save_media_record(
+                        chat_id, 'voice', voice_url,
+                        buyer_id=send_user_id, item_id=item_id
+                    )
+                    await self.media_downloader.enqueue(media_file_id, chat_id, 'voice', voice_url)
             elif content_type == 4:
+                video_url = self._extract_video_url(message)
                 send_message = "[用户发送了一个视频]"
-                logger.info("收到视频消息")
+                logger.info(f"收到视频消息, URL: {video_url}")
+                if video_url:
+                    media_file_id = self.context_manager.save_media_record(
+                        chat_id, 'video', video_url,
+                        buyer_id=send_user_id, item_id=item_id
+                    )
+                    await self.media_downloader.enqueue(media_file_id, chat_id, 'video', video_url)
 
             # 获取完整的对话上下文
             context = self.context_manager.get_context_by_chat(chat_id)
@@ -752,8 +814,9 @@ class XianyuLive:
                 return
             
             # 添加用户消息到上下文
-            self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message)
-            
+            self.context_manager.add_message_by_chat(chat_id, send_user_id, item_id, "user", send_message,
+                                                     content_type=content_type, media_file_id=media_file_id)
+
             # 检查是否为价格意图，如果是则增加议价次数
             if bot.last_intent == "price":
                 self.context_manager.increment_bargain_count_by_chat(chat_id)
@@ -842,6 +905,9 @@ class XianyuLive:
         # 启动 Cookie 输入服务器
         await self._start_cookie_server()
 
+        # 启动媒体下载器
+        await self.media_downloader.start()
+
         # 启动主动 Cookie 刷新循环（与主循环并行）
         if COOKIE_REFRESH_ENABLED:
             self.cookie_refresh_task = asyncio.create_task(self.proactive_cookie_refresh_loop())
@@ -850,6 +916,7 @@ class XianyuLive:
             await self._ws_loop()
         finally:
             # 清理全局任务
+            await self.media_downloader.stop()
             if self.cookie_refresh_task:
                 self.cookie_refresh_task.cancel()
                 try:

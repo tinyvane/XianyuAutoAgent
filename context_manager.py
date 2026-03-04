@@ -8,21 +8,29 @@ from loguru import logger
 class ChatContextManager:
     """
     聊天上下文管理器
-    
+
     负责存储和检索用户与商品之间的对话历史，使用SQLite数据库进行持久化存储。
     支持按会话ID检索对话历史，以及议价次数统计。
+    支持按卖家ID隔离数据（data/sellers/{seller_id}/）。
     """
-    
-    def __init__(self, max_history=100, db_path="data/chat_history.db"):
+
+    def __init__(self, max_history=100, db_path="data/chat_history.db", seller_id=None):
         """
         初始化聊天上下文管理器
-        
+
         Args:
             max_history: 每个对话保留的最大消息数
-            db_path: SQLite数据库文件路径
+            db_path: SQLite数据库文件路径（seller_id 为空时使用）
+            seller_id: 卖家ID，设置后数据存储到 data/sellers/{seller_id}/
         """
         self.max_history = max_history
-        self.db_path = db_path
+        self.seller_id = seller_id
+        if seller_id:
+            self.seller_root = os.path.join("data", "sellers", str(seller_id))
+            self.db_path = os.path.join(self.seller_root, "chat_history.db")
+        else:
+            self.seller_root = None
+            self.db_path = db_path
         self._init_db()
         
     def _init_db(self):
@@ -87,7 +95,38 @@ class ChatContextManager:
             last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
         )
         ''')
-        
+
+        # 创建媒体文件表
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS media_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id INTEGER,
+            chat_id TEXT NOT NULL,
+            buyer_id TEXT,
+            item_id TEXT,
+            media_type TEXT NOT NULL,
+            original_url TEXT,
+            local_path TEXT,
+            file_size INTEGER,
+            download_status TEXT DEFAULT 'pending',
+            metadata TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            downloaded_at DATETIME
+        )
+        ''')
+
+        cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_media_chat ON media_files (chat_id)
+        ''')
+
+        # 迁移 messages 表：添加 content_type 和 media_file_id 列
+        if 'content_type' not in columns:
+            cursor.execute('ALTER TABLE messages ADD COLUMN content_type INTEGER DEFAULT 1')
+            logger.info("已为messages表添加content_type字段")
+        if 'media_file_id' not in columns:
+            cursor.execute('ALTER TABLE messages ADD COLUMN media_file_id INTEGER')
+            logger.info("已为messages表添加media_file_id字段")
+
         conn.commit()
         conn.close()
         logger.info(f"聊天历史数据库初始化完成: {self.db_path}")
@@ -163,25 +202,27 @@ class ChatContextManager:
         finally:
             conn.close()
 
-    def add_message_by_chat(self, chat_id, user_id, item_id, role, content):
+    def add_message_by_chat(self, chat_id, user_id, item_id, role, content, content_type=1, media_file_id=None):
         """
         基于会话ID添加新消息到对话历史
-        
+
         Args:
             chat_id: 会话ID
             user_id: 用户ID (用户消息存真实user_id，助手消息存卖家ID)
             item_id: 商品ID
             role: 消息角色 (user/assistant)
             content: 消息内容
+            content_type: 内容类型 (1=文字, 2=图片, 3=语音, 4=视频)
+            media_file_id: 关联的 media_files.id
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
+
         try:
             # 插入新消息，使用chat_id作为额外标识
             cursor.execute(
-                "INSERT INTO messages (user_id, item_id, role, content, timestamp, chat_id) VALUES (?, ?, ?, ?, ?, ?)",
-                (user_id, item_id, role, content, datetime.now().isoformat(), chat_id)
+                "INSERT INTO messages (user_id, item_id, role, content, timestamp, chat_id, content_type, media_file_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (user_id, item_id, role, content, datetime.now().isoformat(), chat_id, content_type, media_file_id)
             )
             
             # 检查是否需要清理旧消息（基于chat_id）
@@ -306,4 +347,127 @@ class ChatContextManager:
             logger.error(f"获取议价次数时出错: {e}")
             return 0
         finally:
-            conn.close() 
+            conn.close()
+
+    # ── 媒体文件相关方法 ──
+
+    def get_media_dir(self, chat_id, media_type):
+        """
+        获取并创建媒体目录
+
+        Args:
+            chat_id: 会话ID
+            media_type: 媒体类型 ('image'/'voice'/'video')
+
+        Returns:
+            str: 媒体目录的绝对路径
+        """
+        type_dir_map = {'image': 'images', 'voice': 'voice', 'video': 'video'}
+        sub_dir = type_dir_map.get(media_type, media_type)
+
+        if self.seller_root:
+            media_dir = os.path.join(self.seller_root, "media", str(chat_id), sub_dir)
+        else:
+            media_dir = os.path.join("data", "media", str(chat_id), sub_dir)
+
+        os.makedirs(media_dir, exist_ok=True)
+        return media_dir
+
+    def save_media_record(self, chat_id, media_type, original_url, buyer_id=None, item_id=None, metadata=None):
+        """
+        保存媒体索引记录
+
+        Args:
+            chat_id: 会话ID
+            media_type: 'image' / 'voice' / 'video'
+            original_url: 原始URL
+            buyer_id: 买家ID
+            item_id: 商品ID
+            metadata: 附加元数据(dict)
+
+        Returns:
+            int: 新记录的ID
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        try:
+            meta_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
+            cursor.execute(
+                """INSERT INTO media_files
+                   (chat_id, buyer_id, item_id, media_type, original_url, metadata)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (chat_id, buyer_id, item_id, media_type, original_url, meta_json)
+            )
+            conn.commit()
+            media_id = cursor.lastrowid
+            logger.debug(f"媒体记录已保存: id={media_id}, type={media_type}, chat={chat_id}")
+            return media_id
+        except Exception as e:
+            logger.error(f"保存媒体记录失败: {e}")
+            conn.rollback()
+            return None
+        finally:
+            conn.close()
+
+    def update_media_download(self, media_id, local_path, file_size=None, status='completed'):
+        """
+        下载完成后更新媒体记录
+
+        Args:
+            media_id: media_files.id
+            local_path: 相对于 seller_root 的本地路径
+            file_size: 文件大小 (bytes)
+            status: 下载状态
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute(
+                """UPDATE media_files
+                   SET local_path = ?, file_size = ?, download_status = ?, downloaded_at = ?
+                   WHERE id = ?""",
+                (local_path, file_size, status, datetime.now().isoformat(), media_id)
+            )
+            conn.commit()
+            logger.debug(f"媒体下载状态已更新: id={media_id}, status={status}")
+        except Exception as e:
+            logger.error(f"更新媒体下载状态失败: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def get_chat_media(self, chat_id, media_type=None):
+        """
+        查询某会话的所有媒体文件
+
+        Args:
+            chat_id: 会话ID
+            media_type: 可选过滤媒体类型
+
+        Returns:
+            list[dict]: 媒体记录列表
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        try:
+            if media_type:
+                cursor.execute(
+                    "SELECT * FROM media_files WHERE chat_id = ? AND media_type = ? ORDER BY created_at",
+                    (chat_id, media_type)
+                )
+            else:
+                cursor.execute(
+                    "SELECT * FROM media_files WHERE chat_id = ? ORDER BY created_at",
+                    (chat_id,)
+                )
+
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"查询媒体记录失败: {e}")
+            return []
+        finally:
+            conn.close()
