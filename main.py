@@ -11,7 +11,7 @@ import sys
 import random
 
 
-from utils.xianyu_utils import generate_mid, generate_uuid, trans_cookies, generate_device_id, decrypt
+from utils.xianyu_utils import generate_mid, generate_uuid, trans_cookies, generate_device_id, decrypt, mid2url
 from XianyuAgent import XianyuReplyBot
 from context_manager import ChatContextManager
 from utils.notifier import get_notifier
@@ -415,15 +415,20 @@ class XianyuLive:
         except Exception:
             return False
     
+    # 多媒体消息类型白名单，不应被当作系统消息过滤
+    MEDIA_REMINDER_TYPES = {'[图片]', '[语音]', '[视频]', '[表情]'}
+
     def is_bracket_system_message(self, message):
         """检查是否为带中括号的系统消息"""
         try:
             if not message or not isinstance(message, str):
                 return False
-            
+
             clean_message = message.strip()
             # 检查是否以 [ 开头，以 ] 结尾
             if clean_message.startswith('[') and clean_message.endswith(']'):
+                if clean_message in self.MEDIA_REMINDER_TYPES:
+                    return False  # 多媒体消息，不过滤
                 logger.debug(f"检测到系统消息: {clean_message}")
                 return True
             return False
@@ -610,7 +615,30 @@ class XianyuLive:
             send_user_name = message["1"]["10"]["reminderTitle"]
             send_user_id = message["1"]["10"]["senderUserId"]
             send_message = message["1"]["10"]["reminderContent"]
-            
+
+            # 提取消息内容类型（1=文字, 2=图片, 3=语音, 4=视频）
+            content_type = 1  # 默认文字
+            image_info = None
+            try:
+                content_layer = message["1"].get("6", {})
+                custom = content_layer.get("3") if isinstance(content_layer, dict) else None
+                if isinstance(custom, dict):
+                    inner_ct = custom.get("4")
+                    if inner_ct is not None:
+                        content_type = int(inner_ct)
+                    if content_type == 2:  # photo
+                        meta = json.loads(custom.get("5", "{}"))
+                        photo = meta.get("photo", {})
+                        media_id = photo.get("mediaId", "")
+                        image_info = {
+                            "mediaId": media_id,
+                            "width": photo.get("extension", {}).get("width", ""),
+                            "height": photo.get("extension", {}).get("height", ""),
+                            "_url": mid2url(media_id) if media_id else "",
+                        }
+            except Exception:
+                pass
+
             # 时效性验证（过滤5分钟前消息）
             if (time.time() * 1000 - create_time) > self.message_expire_time:
                 logger.debug("过期消息丢弃")
@@ -675,14 +703,29 @@ class XianyuLive:
                 logger.info(f"从数据库获取商品信息: {item_id}")
                 
             item_description=f"当前商品的信息如下：{self.build_item_description(item_info)}"
-            
+
+            # 将多媒体消息转换为 LLM 可理解的描述文本
+            if content_type == 2 and image_info:
+                send_message = "[用户发送了一张图片]"
+                logger.info(f"收到图片消息, mediaId: {image_info.get('mediaId', '')}")
+            elif content_type == 2:
+                send_message = "[用户发送了一张图片]"
+                logger.info("收到图片消息 (无元数据)")
+            elif content_type == 3:
+                send_message = "[用户发送了一段语音]"
+                logger.info("收到语音消息")
+            elif content_type == 4:
+                send_message = "[用户发送了一个视频]"
+                logger.info("收到视频消息")
+
             # 获取完整的对话上下文
             context = self.context_manager.get_context_by_chat(chat_id)
             # 生成回复
             bot_reply = bot.generate_reply(
                 send_message,
                 item_description,
-                context=context
+                context=context,
+                image_url=image_info.get("_url") if image_info else None
             )
             
             # 检查是否需要回复

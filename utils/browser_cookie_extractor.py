@@ -107,7 +107,8 @@ class BrowserCookieExtractor:
             await asyncio.sleep(random.uniform(1.0, 2.0))
 
             # 提取所有 cookie（包括 httpOnly）
-            cookies = await context.cookies(GOOFISH_IM_URL)
+            # 需要同时提取 h5api.m.goofish.com 域名的 cookie（如 x5sec），否则 API 请求会被风控拦截
+            cookies = await context.cookies([GOOFISH_IM_URL, "https://h5api.m.goofish.com"])
 
             if not cookies:
                 logger.warning("未获取到任何 cookie")

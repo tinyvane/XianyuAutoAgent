@@ -12,6 +12,9 @@ class XianyuReplyBot:
             api_key=os.getenv("API_KEY"),
             base_url=os.getenv("MODEL_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
         )
+        # 图片处理配置
+        self.image_handling = os.getenv("IMAGE_HANDLING", "text_only")  # text_only / vision
+        self.vision_model = os.getenv("VISION_MODEL_NAME", "qwen-vl-max")
         self._init_system_prompts()
         self._init_agents()
         self.router = IntentRouter(self.agents['classify'])
@@ -72,14 +75,14 @@ class XianyuReplyBot:
         user_assistant_msgs = [msg for msg in context if msg['role'] in ['user', 'assistant']]
         return "\n".join([f"{msg['role']}: {msg['content']}" for msg in user_assistant_msgs])
 
-    def generate_reply(self, user_msg: str, item_desc: str, context: List[Dict]) -> str:
+    def generate_reply(self, user_msg: str, item_desc: str, context: List[Dict], image_url: str = None) -> str:
         """生成回复主流程"""
         # 记录用户消息
         # logger.debug(f'用户所发消息: {user_msg}')
-        
+
         formatted_context = self.format_history(context)
         # logger.debug(f'对话历史: {formatted_context}')
-        
+
         # 1. 路由决策
         detected_intent = self.router.detect(user_msg, item_desc, formatted_context)
 
@@ -108,11 +111,14 @@ class XianyuReplyBot:
         logger.info(f'议价次数: {bargain_count}')
 
         # 4. 生成回复
+        # 当配置为 vision 模式且有图片 URL 时，传递给 agent
+        effective_image_url = image_url if self.image_handling == "vision" else None
         return agent.generate(
             user_msg=user_msg,
             item_desc=item_desc,
             context=formatted_context,
-            bargain_count=bargain_count
+            bargain_count=bargain_count,
+            image_url=effective_image_url
         )
     
     def _extract_bargain_count(self, context: List[Dict]) -> int:
@@ -206,23 +212,41 @@ class BaseAgent:
         self.system_prompt = system_prompt
         self.safety_filter = safety_filter
 
-    def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int = 0) -> str:
+    def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int = 0, image_url: str = None) -> str:
         """生成回复模板方法"""
-        messages = self._build_messages(user_msg, item_desc, context)
+        messages = self._build_messages(user_msg, item_desc, context, image_url=image_url)
         response = self._call_llm(messages)
         return self.safety_filter(response)
 
-    def _build_messages(self, user_msg: str, item_desc: str, context: str) -> List[Dict]:
-        """构建消息链"""
-        return [
-            {"role": "system", "content": f"【商品信息】{item_desc}\n【你与客户对话历史】{context}\n{self.system_prompt}"},
-            {"role": "user", "content": user_msg}
-        ]
+    def _build_messages(self, user_msg: str, item_desc: str, context: str, image_url: str = None) -> List[Dict]:
+        """构建消息链，支持视觉模型多模态输入"""
+        system_msg = {"role": "system", "content": f"【商品信息】{item_desc}\n【你与客户对话历史】{context}\n{self.system_prompt}"}
+        if image_url:
+            # OpenAI vision API 多模态格式
+            user_msg_content = [
+                {"type": "text", "text": user_msg},
+                {"type": "image_url", "image_url": {"url": image_url}}
+            ]
+            user_msg_obj = {"role": "user", "content": user_msg_content}
+        else:
+            user_msg_obj = {"role": "user", "content": user_msg}
+        return [system_msg, user_msg_obj]
+
+    def _get_model_for_messages(self, messages: List[Dict]) -> str:
+        """根据消息内容选择模型：包含图片时使用视觉模型"""
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        return os.getenv("VISION_MODEL_NAME", "qwen-vl-max")
+        return os.getenv("MODEL_NAME", "qwen-max")
 
     def _call_llm(self, messages: List[Dict], temperature: float = 0.4) -> str:
-        """调用大模型"""
+        """调用大模型，当消息包含图片时自动切换视觉模型"""
+        model_name = self._get_model_for_messages(messages)
         response = self.client.chat.completions.create(
-            model=os.getenv("MODEL_NAME", "qwen-max"),
+            model=model_name,
             messages=messages,
             temperature=temperature,
             max_tokens=500,
@@ -234,14 +258,14 @@ class BaseAgent:
 class PriceAgent(BaseAgent):
     """议价处理Agent"""
 
-    def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int=0) -> str:
+    def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int=0, image_url: str = None) -> str:
         """重写生成逻辑"""
         dynamic_temp = self._calc_temperature(bargain_count)
-        messages = self._build_messages(user_msg, item_desc, context)
+        messages = self._build_messages(user_msg, item_desc, context, image_url=image_url)
         messages[0]['content'] += f"\n▲当前议价轮次：{bargain_count}"
 
         response = self.client.chat.completions.create(
-            model=os.getenv("MODEL_NAME", "qwen-max"),
+            model=self._get_model_for_messages(messages),
             messages=messages,
             temperature=dynamic_temp,
             max_tokens=500,
@@ -256,13 +280,13 @@ class PriceAgent(BaseAgent):
 
 class TechAgent(BaseAgent):
     """技术咨询Agent"""
-    def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int=0) -> str:
+    def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int=0, image_url: str = None) -> str:
         """重写生成逻辑"""
-        messages = self._build_messages(user_msg, item_desc, context)
+        messages = self._build_messages(user_msg, item_desc, context, image_url=image_url)
         # messages[0]['content'] += "\n▲知识库：\n" + self._fetch_tech_specs()
 
         response = self.client.chat.completions.create(
-            model=os.getenv("MODEL_NAME", "qwen-max"),
+            model=self._get_model_for_messages(messages),
             messages=messages,
             temperature=0.4,
             max_tokens=500,

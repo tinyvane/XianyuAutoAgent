@@ -38,3 +38,18 @@ def generate_sign(t, token, data):
 def decrypt(data):
     res = xianyu_js.call('decrypt', data)
     return res
+
+
+def mid2url(media_id: str) -> str:
+    """将闲鱼图片 mediaId 转换为可访问的图片 URL"""
+    if not media_id:
+        return ""
+    # 尝试通过 JS bridge 调用 mid2Url
+    try:
+        url = xianyu_js.call('mid2Url', media_id)
+        if url:
+            return url
+    except Exception:
+        pass
+    # 降级：拼接 CDN URL
+    return f"https://impaas-static.dingtalk.com/media/{media_id}"

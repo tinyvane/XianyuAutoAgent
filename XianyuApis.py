@@ -17,9 +17,11 @@ MAX_REQUEST_INTERVAL = float(os.getenv("MAX_REQUEST_INTERVAL", "5.0"))
 class XianyuApis:
     def __init__(self):
         self.url = 'https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/'
-        self.session = curl_requests.Session(impersonate="chrome133a")
+        self.session = curl_requests.Session(impersonate="chrome142")
         self.on_rgv587_callback = None  # 风控恢复回调
         self._request_timestamps = deque(maxlen=20)  # 滑动窗口请求记录
+        self._rgv587_recovery_count = 0  # 风控恢复尝试次数
+        self._rgv587_max_retries = 3  # 最大自动恢复次数
         self.session.headers.update({
             'accept': 'application/json',
             'accept-language': 'zh-CN,zh;q=0.9',
@@ -28,13 +30,13 @@ class XianyuApis:
             'pragma': 'no-cache',
             'priority': 'u=1, i',
             'referer': 'https://www.goofish.com/',
-            'sec-ch-ua': '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
+            'sec-ch-ua': '"Google Chrome";v="145", "Chromium";v="145", "Not/A)Brand";v="24"',
             'sec-ch-ua-mobile': '?0',
             'sec-ch-ua-platform': '"Windows"',
             'sec-fetch-dest': 'empty',
             'sec-fetch-mode': 'cors',
             'sec-fetch-site': 'same-site',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
         })
         
     def clear_duplicate_cookies(self):
@@ -192,13 +194,18 @@ class XianyuApis:
             time.sleep(0.5)
             return self.hasLogin(retry_count + 1)
 
-    def get_token(self, device_id, retry_count=0):
+    def get_token(self, device_id, retry_count=0, _haslogin_attempted=False):
         if retry_count >= 2:  # 最多重试3次
+            if _haslogin_attempted:
+                # hasLogin 已尝试过仍然失败，不再循环
+                logger.error("重新登录后仍无法获取token，Cookie可能已失效")
+                logger.error("程序即将退出，请更新.env文件中的COOKIES_STR后重新启动")
+                sys.exit(1)
             logger.warning("获取token失败，尝试重新登陆")
             # 尝试通过hasLogin重新登录
             if self.hasLogin():
                 logger.info("重新登录成功，重新尝试获取token")
-                return self.get_token(device_id, 0)  # 重置重试次数
+                return self.get_token(device_id, 0, _haslogin_attempted=True)
             else:
                 logger.error("重新登录失败，Cookie已失效")
                 logger.error("程序即将退出，请更新.env文件中的COOKIES_STR后重新启动")
@@ -244,9 +251,12 @@ class XianyuApis:
                     if 'RGV587_ERROR' in error_msg or '被挤爆啦' in error_msg:
                         logger.error(f"触发风控: {ret_value}")
 
-                        # 层级1: 尝试自动恢复回调（浏览器自动化）
-                        if self.on_rgv587_callback:
-                            logger.info("正在尝试自动恢复...")
+                        # 层级1: 尝试自动恢复回调（浏览器自动化），带退避和次数限制
+                        if self.on_rgv587_callback and self._rgv587_recovery_count < self._rgv587_max_retries:
+                            self._rgv587_recovery_count += 1
+                            backoff = 10 * self._rgv587_recovery_count  # 10s, 20s, 30s 递增退避
+                            logger.info(f"风控恢复第 {self._rgv587_recovery_count}/{self._rgv587_max_retries} 次，等待 {backoff}s 后重试...")
+                            time.sleep(backoff)
                             try:
                                 new_cookie_str = self.on_rgv587_callback(self)
                                 if new_cookie_str and self._apply_new_cookies(new_cookie_str):
@@ -255,6 +265,8 @@ class XianyuApis:
                             except Exception as e:
                                 logger.error(f"自动恢复回调出错: {e}")
                             logger.warning("自动恢复失败，回退到手动输入")
+                        elif self._rgv587_recovery_count >= self._rgv587_max_retries:
+                            logger.warning(f"已达最大自动恢复次数 ({self._rgv587_max_retries})，停止自动重试")
 
                         # 层级2: 手动输入兜底
                         logger.error("请进入闲鱼网页版-点击消息-过滑块-复制最新的Cookie")
@@ -282,6 +294,7 @@ class XianyuApis:
                     return self.get_token(device_id, retry_count + 1)
                 else:
                     logger.info("Token获取成功")
+                    self._rgv587_recovery_count = 0  # 成功后重置风控计数
                     return res_json
             else:
                 logger.error(f"Token API返回格式异常: {res_json}")
