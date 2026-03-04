@@ -779,7 +779,6 @@ class XianyuLive:
                     await self.media_downloader.enqueue(media_file_id, chat_id, 'image', image_url_resolved)
             elif content_type == 3:
                 voice_url = self._extract_voice_url(message)
-                send_message = "[用户发送了一段语音]"
                 logger.info(f"收到语音消息, URL: {voice_url}")
                 if voice_url:
                     media_file_id = self.context_manager.save_media_record(
@@ -787,9 +786,15 @@ class XianyuLive:
                         buyer_id=send_user_id, item_id=item_id
                     )
                     await self.media_downloader.enqueue(media_file_id, chat_id, 'voice', voice_url)
+                    voice_transcript = bot.understand_voice(voice_url, item_description)
+                    if voice_transcript:
+                        send_message = f"[用户发送了一段语音，语音内容为：{voice_transcript}。请根据商品信息判断语音内容是否与商品相关再回复，如果无关请礼貌说明。]"
+                    else:
+                        send_message = "[用户发送了一段语音，无法识别内容]"
+                else:
+                    send_message = "[用户发送了一段语音，无法识别内容]"
             elif content_type == 4:
                 video_url = self._extract_video_url(message)
-                send_message = "[用户发送了一个视频]"
                 logger.info(f"收到视频消息, URL: {video_url}")
                 if video_url:
                     media_file_id = self.context_manager.save_media_record(
@@ -797,6 +802,13 @@ class XianyuLive:
                         buyer_id=send_user_id, item_id=item_id
                     )
                     await self.media_downloader.enqueue(media_file_id, chat_id, 'video', video_url)
+                    video_desc = bot.understand_video(video_url, item_description)
+                    if video_desc:
+                        send_message = f"[用户发送了一个视频，视频内容为：{video_desc}。请根据商品信息判断视频内容是否与商品相关再回复，如果无关请礼貌说明。]"
+                    else:
+                        send_message = "[用户发送了一个视频，无法识别内容]"
+                else:
+                    send_message = "[用户发送了一个视频，无法识别内容]"
 
             # 获取完整的对话上下文
             context = self.context_manager.get_context_by_chat(chat_id)

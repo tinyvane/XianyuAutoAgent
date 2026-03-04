@@ -143,6 +143,54 @@ class XianyuReplyBot:
                     pass
         return 0
 
+    def understand_voice(self, voice_url: str, item_desc: str) -> str:
+        """调用语音理解模型，将语音转写为文本"""
+        try:
+            audio_model = os.getenv("AUDIO_MODEL_NAME", "qwen2-audio-instruct")
+            messages = [
+                {"role": "system", "content": "你是一个语音转写助手。请将用户发送的语音内容准确转写为文字，只输出语音的文字内容，不要添加任何额外说明。"},
+                {"role": "user", "content": [
+                    {"type": "input_audio", "input_audio": {"url": voice_url}},
+                    {"type": "text", "text": "请将这段语音转写为文字。"}
+                ]}
+            ]
+            response = self.client.chat.completions.create(
+                model=audio_model,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=500
+            )
+            transcript = response.choices[0].message.content.strip()
+            logger.info(f"语音转写结果: {transcript}")
+            return transcript
+        except Exception as e:
+            logger.error(f"语音理解失败: {e}")
+            return ""
+
+    def understand_video(self, video_url: str, item_desc: str) -> str:
+        """调用视觉模型理解视频内容"""
+        try:
+            vision_model = os.getenv("VISION_MODEL_NAME", "qwen-vl-max")
+            messages = [
+                {"role": "system", "content": f"你是一个视频内容分析助手。请用2-3句话简洁描述视频的主要内容。\n参考商品信息：{item_desc}"},
+                {"role": "user", "content": [
+                    {"type": "video_url", "video_url": {"url": video_url}},
+                    {"type": "text", "text": "请简洁描述这个视频的内容。"}
+                ]}
+            ]
+            response = self.client.chat.completions.create(
+                model=vision_model,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=500
+            )
+            description = response.choices[0].message.content.strip()
+            logger.info(f"视频理解结果: {description}")
+            return description
+        except Exception as e:
+            logger.error(f"视频理解失败: {e}")
+            return ""
+
     def reload_prompts(self):
         """重新加载所有提示词"""
         logger.info("正在重新加载提示词...")
